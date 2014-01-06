@@ -101,11 +101,33 @@ class ActionHandler(object):
 
 class MessageRequest(models.Model):
     """ An initial request to broadcast an e-mail message """
+
+    SEND_TO_SELF = 'esp.dbmail.models.MessageRequest.send_to_self'
+    SEND_TO_GUARDIAN = 'esp.dbmail.models.MessageRequest.send_to_guardian'
+    SEND_TO_EMERGENCY = 'esp.dbmail.models.MessageRequest.send_to_emergency'
+    SEND_TO_SELF_AND_GUARDIAN = 'esp.dbmail.models.MessageRequest.send_to_self_and_guardian'
+    SEND_TO_SELF_AND_EMERGENCY = 'esp.dbmail.models.MessageRequest.send_to_self_and_emergency'
+    SEND_TO_GUARDIAN_AND_EMERGENCY = 'esp.dbmail.models.MessageRequest.send_to_guardian_and_emergency'
+    SEND_TO_SELF_AND_GUARDIAN_AND_EMERGENCY = 'esp.dbmail.models.MessageRequest.send_to_self_and_guardian_and_emergency'
+    SENDTO_FN_CHOICES = (
+        (SEND_TO_SELF, 'send to user'),
+        (SEND_TO_GUARDIAN, 'send to guardian'),
+        (SEND_TO_EMERGENCY, 'send to emergency contact'),
+        (SEND_TO_SELF_AND_GUARDIAN, 'send to user and guardian'),
+        (SEND_TO_SELF_AND_EMERGENCY, 'send to user and emergency contact'),
+        (SEND_TO_GUARDIAN_AND_EMERGENCY, 'send to guardian and emergency contact'),
+        (SEND_TO_SELF_AND_GUARDIAN_AND_EMERGENCY, 'send to user and guardian and emergency contact'),
+    )
+
     id = models.AutoField(primary_key=True)
     subject = models.TextField(null=True,blank=True) 
     msgtext = models.TextField(blank=True, null=True) 
     special_headers = models.TextField(blank=True, null=True) 
     recipients = models.ForeignKey(PersistentQueryFilter) # We will get the user from a query filter
+    sendto_fn = models.CharField("sendto function", max_length=1024,
+                    choices=SENDTO_FN_CHOICES, default=SEND_TO_SELF,
+                    help_text="A function that takes an ESPUser and returns a " +
+                    "list of sendto addresses, of the form (email, name).")
     sender = models.TextField(blank=True, null=True) # E-mail sender; should be a valid SMTP sender string 
     creator = AjaxForeignKey(ESPUser) # the person who sent this message
     processed = models.BooleanField(default=False, db_index=True) # Have we made EmailRequest objects from this MessageRequest yet?
@@ -183,26 +205,145 @@ class MessageRequest(models.Model):
             users = users.distinct()
         except:
             pass
+
+        # Get the sendto function
+        sendto_fn = self.sendto_fn
+        i = sendto_fn.rfind('.')
+        cls_or_module, attr = sendto_fn[:i], sendto_fn[i+1:]
+        i = cls_or_module.rfind('.')
+        module, cls_or_module = cls_or_module[:i], cls_or_module[i+1:]
+        from django.core.exceptions import ImproperlyConfigured
+        from django.utils.importlib import import_module
+        try:
+            module = import_module(module)
+        except ImportError, e:
+            raise ImproperlyConfigured('Error importing %s: "%s"' % (module, e))
+        try:
+            cls_or_module = getattr(module, cls_or_module)
+        except AttributeError:
+            raise ImproperlyConfigured('"%s" does not define "%s"' % (module, cls_or_module))
+        try:
+            sendto_fn = getattr(cls_or_module, attr)
+        except AttributeError:
+            raise ImproperlyConfigured('"%s" does not define a "%s" callable sendto function' % (cls_or_module, attr))
         
         # go through each user and parse the text...then create the proper
         # emailrequest and textofemail object
         for user in users:
             user = ESPUser(user)
-            newemailrequest = EmailRequest(target = user, msgreq = self)
-            
-            newtxt = TextOfEmail(send_to   = '%s <%s>' % (user.name(), user.email),
-                                 send_from = send_from,
-                                 subject   = self.parseSmartText(self.subject, user),
-                                 msgtext   = self.parseSmartText(self.msgtext, user),
-                                 sent      = None)
+            subject = self.parseSmartText(self.subject, user)
+            msgtext = self.parseSmartText(self.msgtext, user)
 
-            newtxt.save()
+            # For each user, create an EmailRequest and a TextOfEmail
+            # for each address given by the output of the sendto function.
+            for address_pair in sendto_fn(user):
+                newemailrequest = EmailRequest(target = user, msgreq = self)
 
-            newemailrequest.textofemail = newtxt
+                newtxt = TextOfEmail(send_to   = ESPUser.email_sendto_address(*address_pair),
+                                     send_from = send_from,
+                                     subject   = subject,
+                                     msgtext   = msgtext,
+                                     sent      = None)
 
-            newemailrequest.save()
+                newtxt.save()
+
+                newemailrequest.textofemail = newtxt
+
+                newemailrequest.save()
 
         print 'Prepared e-mails to send for message request %d: %s' % (self.id, self.subject)
+
+    @staticmethod
+    def send_to_self(user):
+        """
+        Returns a single address, the user's own address.
+        """
+        return [user.get_email_sendto_address_pair()]
+
+    @staticmethod
+    def send_to_contact(user, contact):
+        """
+        Returns a single address, the one of the user's contacts.
+        Can be either the guardian or the emergency contact,
+        depending on whether contact is 'guardian' or 'emergency'.
+        Can also return no addresses, if the contact does not exist.
+        """
+        profile = user.getLastProfile()
+        if not profile:
+            return []
+        contact_info = getattr(profile, 'contact_' + contact, profile.contact_guardian)
+        if contact_info and contact_info.email:
+            return [contact_info.get_email_sendto_address_pair()]
+        return []
+
+    @staticmethod
+    def send_to_guardian(user):
+        """
+        Returns a single address, the user's guardian.
+        """
+        return MessageRequest.send_to_contact(user, 'guardian')
+
+    @staticmethod
+    def send_to_emergency(user):
+        """
+        Returns a single address, the user's emergency contact.
+        """
+        return MessageRequest.send_to_contact(user, 'emergency')
+
+    @staticmethod
+    def send_to_combination(user, sendto_fns):
+        """
+        Given a list of sendto functions, returns the concatenation of all
+        their outputs. Duplicate emails are ignored.
+        """
+        emails = []
+        address_pairs = []
+        for fn in sendto_fns:
+            for address_pair in fn(user):
+                if address_pair[0] not in emails:
+                # Duplicate emails are ignored.
+                    emails.append(address_pair[0])
+                    address_pairs.append(address_pair)
+        return address_pairs
+
+    @staticmethod
+    def send_to_self_and_guardian(user):
+        """
+        Returns two addresses, the user's own address and its guardian.
+        """
+        return MessageRequest.send_to_combination(user,
+                                  [MessageRequest.send_to_self,
+                                   MessageRequest.send_to_guardian])
+
+    @staticmethod
+    def send_to_self_and_emergency(user):
+        """
+        Returns two addresses, the user's own address and its emergency
+        contact.
+        """
+        return MessageRequest.send_to_combination(user,
+                                  [MessageRequest.send_to_self,
+                                   MessageRequest.send_to_emergency])
+
+    @staticmethod
+    def send_to_guardian_and_emergency(user):
+        """
+        Returns two addresses, the user's guardian and emergency contact.
+        """
+        return MessageRequest.send_to_combination(user,
+                                  [MessageRequest.send_to_guardian,
+                                   MessageRequest.send_to_emergency])
+
+    @staticmethod
+    def send_to_self_and_guardian_and_emergency(user):
+        """
+        Returns three addresses, the user's own address, its guardian, and its
+        emergency contact.
+        """
+        return MessageRequest.send_to_combination(user,
+                                  [MessageRequest.send_to_self,
+                                   MessageRequest.send_to_guardian,
+                                   MessageRequest.send_to_emergency])
 
 
     class Admin:
