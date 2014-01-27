@@ -54,7 +54,7 @@ class LotteryAssignmentController(object):
     default_options = {
         'Kp': 1.2,
         'Ki': 1.1,
-        'check_grade': True,
+        'check_grade': False,
         'stats_display': False,
         'directory': os.getenv("HOME"),
         'use_student_apps': False,
